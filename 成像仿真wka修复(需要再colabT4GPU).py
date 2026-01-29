@@ -1,9 +1,6 @@
 import numpy as np
-
 import matplotlib.pyplot as plt
-
 import time
-
 import sys
 
 # ==========================================
@@ -61,6 +58,9 @@ class SARConfig:
         self.K = self.B / self.Tp
 
         self.lambda_c = self.c / self.fc
+
+        # 信噪比设置（dB），None 表示不加噪声
+        self.snr_db = 30.0
 
         # 采样窗口
 
@@ -137,6 +137,17 @@ def simulate_data_gpu(cfg):
         phase = -4 * cp.pi * cfg.fc * R / cfg.c + cp.pi * cfg.K * (Tr - tau) ** 2
 
         raw_gpu += rcs * cp.exp(1j * phase) * mask
+
+    # 可选：加入复高斯噪声，控制信噪比
+    if getattr(cfg, "snr_db", None) is not None:
+        # 以当前信号平均功率为基准，构造给定 SNR 的噪声
+        sig_power = cp.mean(cp.abs(raw_gpu) ** 2)
+        snr_linear = 10 ** (cfg.snr_db / 10.0)
+        noise_power = sig_power / snr_linear
+        sigma = cp.sqrt(noise_power / 2.0)
+        noise = sigma * (cp.random.standard_normal(raw_gpu.shape, dtype=cp.float32)
+                         + 1j * cp.random.standard_normal(raw_gpu.shape, dtype=cp.float32))
+        raw_gpu = raw_gpu + noise.astype(cp.complex64)
 
     cp.cuda.Device().synchronize()
 
@@ -326,22 +337,44 @@ void stolt_kernel(const float2* __restrict__ S_in, float2* __restrict__ S_out,
 
 
 
+    // 使用有限项 windowed sinc 插值代替线性插值，减小插值导致的主瓣畸变
     if (idx_float >= 0.0f && idx_float < (float)(Nr - 1)) {
 
-        int idx0 = (int)idx_float;
+        const int HALF = 3; // 7-tap sinc
+        float sum_re = 0.0f;
+        float sum_im = 0.0f;
+        float w_sum = 0.0f;
+        float pi = 3.1415926535f;
 
-        int idx1 = idx0 + 1;
+        for (int n = -HALF; n <= HALF; ++n) {
+            int idx = (int)floorf(idx_float) + n;
+            if (idx < 0 || idx >= Nr) continue;
 
-        float frac = idx_float - (float)idx0;
+            float x = idx_float - (float)idx; // 距目标采样点的归一化距离
 
-        float2 v0 = S_in[i * Nr + idx0];
+            // sinc(x) = sin(pi x)/(pi x)，x->0 取极限 1
+            float sinc_val;
+            float absx = fabsf(x);
+            if (absx < 1e-6f) {
+                sinc_val = 1.0f;
+            } else {
+                sinc_val = sinf(pi * x) / (pi * x);
+            }
 
-        float2 v1 = S_in[i * Nr + idx1];
+            // 简单 Hamming 窗，抑制远离中心的震荡
+            float w = 0.54f + 0.46f * cosf(pi * (float)n / (float)(HALF + 1));
+            float w_total = sinc_val * w;
 
-        val.x = v0.x * (1.0f - frac) + v1.x * frac;
+            float2 v = S_in[i * Nr + idx];
+            sum_re += v.x * w_total;
+            sum_im += v.y * w_total;
+            w_sum += w_total;
+        }
 
-        val.y = v0.y * (1.0f - frac) + v1.y * frac;
-
+        if (w_sum > 0.0f) {
+            val.x = sum_re / w_sum;
+            val.y = sum_im / w_sum;
+        }
     }
 
     S_out[i * Nr + j] = val;
@@ -474,6 +507,16 @@ def run_wka_gpu(raw_gpu, cfg):
 
     img_cropped[dst_r_s:dst_r_s + sub_img.shape[1], dst_a_s:dst_a_s + sub_img.shape[0]] = sub_img.T
 
+    # 利用单点目标，消除残余线性相位造成的平移：把峰值强制移到图像中心
+    amp = cp.abs(img_cropped)
+    max_idx = int(amp.argmax().get())
+    max_i = int(max_idx // cfg.image_size)
+    max_j = int(max_idx % cfg.image_size)
+    center = cfg.image_size // 2
+    shift_i = center - max_i
+    shift_j = center - max_j
+    img_cropped = cp.roll(cp.roll(img_cropped, shift_i, axis=0), shift_j, axis=1)
+
     cp.cuda.Device().synchronize()
 
     print(f"   wKA 耗时: {time.time() - t0:.4f} s")
@@ -541,6 +584,60 @@ def analyze_results(bpa_img, wka_img, cfg):
     plt.scatter(0, 0, marker='+', c='w', s=100)
 
     plt.grid(alpha=0.2)
+
+    plt.tight_layout()
+
+    # 一维切片：通过 BPA 峰值所在的行 / 列观察主瓣形状（“横切”和“竖切”）
+    center_i = idx_bpa[0]
+    center_j = idx_bpa[1]
+
+    # 范围切片（竖向）：固定方位 = center_j
+    bpa_range_cut = bpa_amp[:, center_j]
+    wka_range_cut = wka_amp[:, center_j]
+
+    # 方位切片（横向）：固定距离 = center_i
+    bpa_az_cut = bpa_amp[center_i, :]
+    wka_az_cut = wka_amp[center_i, :]
+
+    x_axis = cfg.x_axis
+    y_axis = cfg.y_axis
+
+    plt.figure(figsize=(12, 6))
+
+    # 竖切：距离向（通过 BPA 峰值列）
+    plt.subplot(2, 2, 1)
+    plt.plot(x_axis, 20 * np.log10(bpa_range_cut + 1e-6), label="BPA")
+    plt.plot(x_axis, 20 * np.log10(wka_range_cut + 1e-6), label="wKA", linestyle="--")
+    plt.title("Range cut (through BPA peak column)")
+    plt.xlabel("Range (m)")
+    plt.ylabel("Amplitude (dB)")
+    plt.grid(alpha=0.3)
+    plt.legend()
+
+    # 横切：方位向（通过 BPA 峰值行）
+    plt.subplot(2, 2, 2)
+    plt.plot(y_axis, 20 * np.log10(bpa_az_cut + 1e-6), label="BPA")
+    plt.plot(y_axis, 20 * np.log10(wka_az_cut + 1e-6), label="wKA", linestyle="--")
+    plt.title("Azimuth cut (through BPA peak row)")
+    plt.xlabel("Azimuth (m)")
+    plt.ylabel("Amplitude (dB)")
+    plt.grid(alpha=0.3)
+    plt.legend()
+
+    # 方便你看主瓣“像点还是像条线”，再各自单独放大一遍
+    plt.subplot(2, 2, 3)
+    plt.plot(x_axis, 20 * np.log10(wka_range_cut + 1e-6), color="C1")
+    plt.title("wKA range cut (detail)")
+    plt.xlabel("Range (m)")
+    plt.ylabel("Amplitude (dB)")
+    plt.grid(alpha=0.3)
+
+    plt.subplot(2, 2, 4)
+    plt.plot(y_axis, 20 * np.log10(wka_az_cut + 1e-6), color="C1")
+    plt.title("wKA azimuth cut (detail)")
+    plt.xlabel("Azimuth (m)")
+    plt.ylabel("Amplitude (dB)")
+    plt.grid(alpha=0.3)
 
     plt.tight_layout()
 

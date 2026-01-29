@@ -1,0 +1,1027 @@
+\chapter{附录代码}
+1.成像4个代码(不同信噪比)
+
+\begin{lstlisting}
+"""
+SAR 成像算法: 终极修正版 (BPA vs wKA)
+------------------------------------------------
+修复日志:
+1. wKA 算法: 修正了 RFM 相位公式。
+   - 采用 "差分相位 (Differential Phase)" 策略。
+   - 移除了导致目标整体漂移的线性相位项。
+   - 确保 wKA 结果与时域回波保持在同一 Range Bin (Index ~200)。
+2. 对齐逻辑: 现在的 wKA 图像中心将严格对应 BPA 的图像中心。
+------------------------------------------------
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+import sys
+
+# ==========================================
+# 0. GPU 环境强制检查
+# ==========================================
+try:
+    import cupy as cp
+    dev_id = cp.cuda.Device().id
+    gpu_name = cp.cuda.runtime.getDeviceProperties(dev_id)['name'].decode('utf-8')
+    print(f"✅ GPU 环境检测成功: {gpu_name}")
+except ImportError:
+    print("❌ 错误: 此代码需要 NVIDIA GPU 和 CuPy。")
+    sys.exit(1)
+
+# ==========================================
+# 1. 配置参数
+# ==========================================
+class SARConfig:
+    def __init__(self):
+        self.c = 299792458.0
+        self.fc = 5.3e9
+        self.B = 80e6            
+        self.Tp = 5e-6          
+        self.fs = 200e6         
+        self.PRF = 1000.0       
+        
+        self.H = 3000.0         
+        self.V = 150.0          
+        self.R0 = np.sqrt(self.H**2)
+        self.L_sar = 600.0      
+        
+        self.K = self.B / self.Tp
+        self.lambda_c = self.c / self.fc
+        
+        # 采样窗口
+        self.R_min = self.R0 - 150.0
+        self.R_max = self.R0 + 150.0
+        
+        self.t_start = 2 * self.R_min / self.c
+        self.t_end = 2 * self.R_max / self.c + self.Tp
+        
+        self.Nr = int((self.t_end - self.t_start) * self.fs)
+        if self.Nr % 2 != 0: self.Nr += 1
+        
+        self.tr = np.linspace(self.t_start, self.t_start + self.Nr/self.fs, self.Nr, endpoint=False)
+        self.Na = int(self.L_sar / self.V * self.PRF)
+        self.ta = np.linspace(-self.L_sar/(2*self.V), self.L_sar/(2*self.V), self.Na)
+        
+        # 成像网格
+        self.image_size = 512
+        self.scene_size = 100.0 
+        self.x_axis = np.linspace(-self.scene_size/2, self.scene_size/2, self.image_size)
+        self.y_axis = np.linspace(-self.scene_size/2, self.scene_size/2, self.image_size)
+
+        print("\n�� 系统参数:")
+        print(f"   Matrix: [{self.Na}, {self.Nr}]")
+        print(f"   Range: [{self.R_min:.1f}, {self.R_max:.1f}] m")
+
+TARGETS = [[0, 0, 1.0]] 
+
+# ==========================================
+# 2. 回波模拟 (GPU)
+# ==========================================
+def simulate_data_gpu(cfg):
+    print(f"\n�� --- 生成回波 (GPU) ---")
+    t0 = time.time()
+    ta_gpu = cp.array(cfg.ta, dtype=cp.float32)
+    tr_gpu = cp.array(cfg.tr, dtype=cp.float32)
+    raw_gpu = cp.zeros((cfg.Na, cfg.Nr), dtype=cp.complex64)
+    Ta, Tr = cp.meshgrid(ta_gpu, tr_gpu, indexing='ij')
+    
+    for t in TARGETS:
+        dx, dy, rcs = t
+        pos_x = cfg.R0 + dx
+        pos_y = dy
+        R = cp.sqrt(pos_x**2 + (pos_y - cfg.V * Ta)**2)
+        tau = 2 * R / cfg.c
+        mask = (cp.abs(Tr - tau) <= cfg.Tp/2)
+        phase = -4 * cp.pi * cfg.fc * R / cfg.c + cp.pi * cfg.K * (Tr - tau)**2
+        raw_gpu += rcs * cp.exp(1j * phase) * mask
+
+    cp.cuda.Device().synchronize()
+    print(f"   耗时: {time.time()-t0:.4f} s")
+    return raw_gpu
+
+# ==========================================
+# 3. BPA (GPU Kernel)
+# ==========================================
+bpa_kernel_code = r'''
+extern "C" __global__
+void bpa_kernel(const float2* __restrict__ raw, float2* __restrict__ img, 
+                const float* __restrict__ x_ax, const float* __restrict__ y_ax, 
+                const float* __restrict__ ta,
+                int Nx, int Ny, int Na, int Nr,
+                float c, float fc, float fs, float R0, float t_start, float V) {
+    
+    int i = blockIdx.x * blockDim.x + threadIdx.x; 
+    int j = blockIdx.y * blockDim.y + threadIdx.y; 
+    
+    if (i >= Nx || j >= Ny) return;
+    
+    float px = x_ax[i] + R0; 
+    float py = y_ax[j];      
+    
+    float sum_re = 0.0f;
+    float sum_im = 0.0f;
+    float lambda = c / fc;
+    float pi = 3.1415926535f;
+    
+    for (int k = 0; k < Na; k++) {
+        float sy = V * ta[k]; 
+        float R = sqrtf(px*px + (py - sy)*(py - sy));
+        float delay = 2.0f * R / c;
+        float idx_f = (delay - t_start) * fs;
+        int idx = (int)idx_f;
+        
+        if (idx >= 0 && idx < Nr - 1) {
+            float frac = idx_f - (float)idx;
+            float2 s0 = raw[k * Nr + idx];
+            float2 s1 = raw[k * Nr + idx + 1];
+            float val_re = s0.x * (1.0f - frac) + s1.x * frac;
+            float val_im = s0.y * (1.0f - frac) + s1.y * frac;
+            float phase = 4.0f * pi * R / lambda;
+            float cp_val = cosf(phase);
+            float sp_val = sinf(phase);
+            sum_re += val_re * cp_val - val_im * sp_val;
+            sum_im += val_re * sp_val + val_im * cp_val;
+        }
+    }
+    img[i * Ny + j] = make_float2(sum_re, sum_im);
+}
+'''
+
+def run_bpa_gpu(raw_gpu, cfg):
+    print("\n�� --- 启动 BPA (GPU) ---")
+    t0 = time.time()
+    img_gpu = cp.zeros((cfg.image_size, cfg.image_size), dtype=cp.complex64)
+    x_ax = cp.array(cfg.x_axis, dtype=cp.float32)
+    y_ax = cp.array(cfg.y_axis, dtype=cp.float32)
+    ta = cp.array(cfg.ta, dtype=cp.float32)
+    
+    module = cp.RawModule(code=bpa_kernel_code)
+    kernel = module.get_function('bpa_kernel')
+    block = (16, 16)
+    grid = ((cfg.image_size + 15) // 16, (cfg.image_size + 15) // 16)
+    
+    kernel(grid, block, (raw_gpu, img_gpu, x_ax, y_ax, ta, 
+                         cfg.image_size, cfg.image_size, cfg.Na, cfg.Nr,
+                         cp.float32(cfg.c), cp.float32(cfg.fc), cp.float32(cfg.fs), 
+                         cp.float32(cfg.R0), cp.float32(cfg.t_start), cp.float32(cfg.V)))
+    
+    cp.cuda.Device().synchronize()
+    print(f"   BPA 耗时: {time.time()-t0:.4f} s")
+    return img_gpu
+
+# ==========================================
+# 4. wKA (修正后的 GPU 流程)
+# ==========================================
+stolt_kernel_code = r'''
+extern "C" __global__
+void stolt_kernel(const float2* __restrict__ S_in, float2* __restrict__ S_out,
+                  const float* __restrict__ fr, const float* __restrict__ fa,
+                  int Na, int Nr, float fc, float c, float V, float fr_min, float fr_df) {
+                  
+    int j = blockIdx.x * blockDim.x + threadIdx.x; 
+    int i = blockIdx.y * blockDim.y + threadIdx.y; 
+    
+    if (i >= Na || j >= Nr) return;
+    
+    float f_out = fr[j]; 
+    float f_a = fa[i];
+    
+    // Stolt Mapping Relation
+    float ky_term = (c * f_a / (2.0f * V));
+    float val_sq = (f_out + fc) * (f_out + fc) + ky_term * ky_term;
+    float f_in = sqrtf(val_sq) - fc;
+    
+    float idx_float = (f_in - fr_min) / fr_df;
+    float2 val = make_float2(0.0f, 0.0f);
+    
+    if (idx_float >= 0.0f && idx_float < (float)(Nr - 1)) {
+        int idx0 = (int)idx_float;
+        int idx1 = idx0 + 1;
+        float frac = idx_float - (float)idx0;
+        float2 v0 = S_in[i * Nr + idx0];
+        float2 v1 = S_in[i * Nr + idx1];
+        val.x = v0.x * (1.0f - frac) + v1.x * frac;
+        val.y = v0.y * (1.0f - frac) + v1.y * frac;
+    }
+    S_out[i * Nr + j] = val;
+}
+'''
+
+def run_wka_gpu(raw_gpu, cfg):
+    print("\n�� --- 启动 wKA (修正版) ---")
+    t0 = time.time()
+    
+    # 1. FFT
+    S2 = cp.fft.fftshift(cp.fft.fft2(raw_gpu))
+    
+    fr = cp.fft.fftshift(cp.fft.fftfreq(cfg.Nr, 1/cfg.fs))
+    fa = cp.fft.fftshift(cp.fft.fftfreq(cfg.Na, 1/cfg.PRF))
+    Fa, Fr = cp.meshgrid(fa, fr, indexing='ij')
+    
+    # 2. 距离压缩 (只保留压缩，不移位)
+    H_rc = cp.exp(1j * cp.pi * Fr**2 / cfg.K)
+    S_rc = S2 * H_rc
+    
+    # 3. RFM (修正: 差分相位补偿)
+    # 目的: 只校正 "弯曲 (Curvature)"，不进行 "平移 (Shift)"
+    # kx_stolt = sqrt((fc+fr)^2 - ...)
+    # kx_linear = fc + fr
+    # Phase = 4pi*R0/c * (kx_stolt - kx_linear)
+    
+    ky_term_sq = (cfg.c * Fa / (2 * cfg.V))**2
+    k_radial_sq = (cfg.fc + Fr)**2 - ky_term_sq
+    valid_mask = k_radial_sq > 0
+    kx_stolt = cp.sqrt(cp.maximum(k_radial_sq, 0))
+    
+    # 关键修正点: 减去线性部分，防止目标飞走
+    kx_linear = cfg.fc + Fr 
+    
+    # 计算相位 (注意: 这里的 kx 单位需要转化为 rad/m 或保持频率量纲一致)
+    # R0/c * (f) * 4pi -> 这里的 kx 是频率
+    phi_rfm = 4 * cp.pi * cfg.R0 / cfg.c * (kx_stolt - kx_linear)
+    
+    S_rfm = S_rc * cp.exp(1j * phi_rfm) * valid_mask
+    
+    # 4. Stolt Kernel
+    S_stolt = cp.zeros_like(S_rfm)
+    fr_min = fr[0].item()
+    fr_df = (fr[1] - fr[0]).item()
+    
+    module = cp.RawModule(code=stolt_kernel_code)
+    kernel = module.get_function('stolt_kernel')
+    block = (32, 32)
+    grid = ((cfg.Nr + 31) // 32, (cfg.Na + 31) // 32)
+    
+    kernel(grid, block, (S_rfm, S_stolt, fr.astype(cp.float32), fa.astype(cp.float32),
+                         cfg.Na, cfg.Nr, cp.float32(cfg.fc), cp.float32(cfg.c), cp.float32(cfg.V),
+                         cp.float32(fr_min), cp.float32(fr_df)))
+    
+    # 5. IFFT & Crop
+    S_final = cp.fft.ifftshift(S_stolt)
+    img_full = cp.fft.ifft2(S_final)
+    
+    # 裁剪逻辑:
+    # 因为我们使用了差分相位，目标依然停留在它在原始时间窗口中的位置。
+    # R0 对应的时间索引:
+    idx_r0 = int((2*cfg.R0/cfg.c - cfg.t_start) * cfg.fs)
+    idx_a0 = cfg.Na // 2
+    
+    w = cfg.image_size // 2
+    img_cropped = cp.zeros((cfg.image_size, cfg.image_size), dtype=cp.complex64)
+    
+    # 计算源区域
+    r_start = idx_r0 - w
+    r_end = idx_r0 + w
+    a_start = idx_a0 - w
+    a_end = idx_a0 + w
+    
+    # 安全边界处理
+    src_r_s = max(0, r_start); src_r_e = min(cfg.Nr, r_end)
+    src_a_s = max(0, a_start); src_a_e = min(cfg.Na, a_end)
+    
+    dst_r_s = w - (idx_r0 - src_r_s)
+    dst_a_s = w - (idx_a0 - src_a_s)
+    
+    # 提取 (注意 Full Image 是 [Azimuth, Range])
+    sub_img = img_full[src_a_s:src_a_e, src_r_s:src_r_e]
+    
+    # 转置以匹配 BPA [Range, Azimuth]
+    img_cropped[dst_r_s:dst_r_s+sub_img.shape[1], dst_a_s:dst_a_s+sub_img.shape[0]] = sub_img.T
+    
+    cp.cuda.Device().synchronize()
+    print(f"   wKA 耗时: {time.time()-t0:.4f} s")
+    
+    return img_cropped
+
+# ==========================================
+# 5. 结果分析
+# ==========================================
+def analyze_results(bpa_img, wka_img, cfg):
+    bpa_amp = cp.asnumpy(cp.abs(bpa_img))
+    wka_amp = cp.asnumpy(cp.abs(wka_img))
+    
+    bpa_amp /= np.max(bpa_amp)
+    wka_amp /= np.max(wka_amp)
+    
+    idx_bpa = np.unravel_index(np.argmax(bpa_amp), bpa_amp.shape)
+    idx_wka = np.unravel_index(np.argmax(wka_amp), wka_amp.shape)
+    
+    pos_bpa = (cfg.x_axis[idx_bpa[0]], cfg.y_axis[idx_bpa[1]])
+    pos_wka = (cfg.x_axis[idx_wka[0]], cfg.y_axis[idx_wka[1]])
+    
+    print("\n�� 最终精度对比:")
+    print(f"   真值: (0.00, 0.00) m")
+    print(f"   BPA:  ({pos_bpa[0]:.2f}, {pos_bpa[1]:.2f}) m | Err: {np.hypot(*pos_bpa):.3f} m")
+    print(f"   wKA:  ({pos_wka[0]:.2f}, {pos_wka[1]:.2f}) m | Err: {np.hypot(*pos_wka):.3f} m")
+    
+    plt.figure(figsize=(12, 5))
+    extent = [cfg.y_axis[0], cfg.y_axis[-1], cfg.x_axis[0], cfg.x_axis[-1]]
+    
+    plt.subplot(1, 2, 1)
+    plt.imshow(20*np.log10(bpa_amp+1e-6), cmap='jet', vmin=-30, vmax=0, origin='lower', extent=extent)
+    plt.title("BPA (Time Domain)")
+    plt.xlabel("Azimuth (m)"); plt.ylabel("Range (m)")
+    plt.scatter(0, 0, marker='+', c='w', s=100)
+    plt.grid(alpha=0.2)
+
+    plt.subplot(1, 2, 2)
+    plt.imshow(20*np.log10(wka_amp+1e-6), cmap='jet', vmin=-30, vmax=0, origin='lower', extent=extent)
+    plt.title("wKA (Freq Domain Corrected)")
+    plt.xlabel("Azimuth (m)"); plt.ylabel("Range (m)")
+    plt.scatter(0, 0, marker='+', c='w', s=100)
+    plt.grid(alpha=0.2)
+    
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == '__main__':
+    cfg = SARConfig()
+    raw = simulate_data_gpu(cfg)
+    img_bpa = run_bpa_gpu(raw, cfg)
+    img_wka = run_wka_gpu(raw, cfg)
+    analyze_results(img_bpa, img_wka, cfg)
+
+
+
+
+\end{lstlisting}
+
+\section{二维成像代码}
+\subsection{二维成像}
+\begin{lstlisting}、
+# -*- coding: utf-8 -*-
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import correlate, resample
+from scipy.interpolate import interp1d
+import warnings
+
+# 忽略除零警告
+warnings.filterwarnings('ignore')
+plt.style.use('dark_background')
+
+def print_section(title):
+    print(f"\n{'='*70}")
+    print(f" {title}")
+    print(f"{'='*70}")
+
+# ==========================================
+# 1. 系统参数
+# ==========================================
+print_section("1. 系统参数")
+
+c = 299792458.0
+fc = 5.3e9
+wavelength = c / fc
+B = 80e6
+fs = 200e6
+Tp = 5e-6
+Nr = int(Tp * fs)
+t_pulse = np.linspace(-Tp/2, Tp/2, Nr)
+
+# SAR 参数
+H = 5000.0
+V = 100.0
+R0 = 10000.0
+PRF = 400.0
+Na = 128
+Tsa = Na / PRF
+range_res = c / (2 * B)
+azimuth_res = wavelength * R0 / (2 * V * Tsa)
+
+# ==========================================
+# 2. 物理归一化 Hermite 基底生成 
+# ==========================================
+print_section("2. 鲁棒的波形生成 (Robust Waveform Gen)")
+
+max_order = 50
+sparse_orders = [10, 18, 27, 36, 45] # 使用的稀疏阶数
+
+# --- 关键修复：动态计算 Sigma ---
+# 目标：让最高阶函数在窗口边缘衰减到接近0
+# 经验公式：X_max approx sqrt(2*n + 1) + 4 (安全余量)
+# 对于 n=50, sqrt(101)=10, 需要 x 范围至少到 14
+x_max_needed = np.sqrt(2 * max_order + 1) + 4.0
+sigma = x_max_needed / (Tp / 2)
+
+print(f"  [Fix] 最大阶数 N={max_order}")
+print(f"  [Fix] 需要的数学域范围 X_max = ±{x_max_needed:.1f}")
+print(f"  [Fix] 修正后的 Sigma = {sigma:.2e} (Hz)")
+
+t_scaled = t_pulse * sigma
+
+# --- 关键修复：递推生成归一化函数 ---
+# 避免使用 hermite(n)(x)，因为它会产生天文数字
+# 使用物理递推: psi_n = sqrt(2/n)*x*psi_{n-1} - sqrt((n-1)/n)*psi_{n-2}
+# psi_0 = pi^(-0.25) * exp(-x^2/2)
+
+hermite_basis = np.zeros((max_order + 1, Nr))
+
+# 初始化 n=0
+norm_factor = np.pi**(-0.25)
+hermite_basis[0, :] = norm_factor * np.exp(-t_scaled**2 / 2)
+
+# 初始化 n=1
+hermite_basis[1, :] = np.sqrt(2) * t_scaled * hermite_basis[0, :]
+
+# 递推 n=2...max_order
+for n in range(2, max_order + 1):
+    c1 = np.sqrt(2.0 / n)
+    c2 = np.sqrt((n - 1.0) / n)
+    hermite_basis[n, :] = c1 * t_scaled * hermite_basis[n-1, :] - c2 * hermite_basis[n-2, :]
+
+# 验证边缘能量
+edge_energy = np.sum(hermite_basis[:, :5]**2) + np.sum(hermite_basis[:, -5:]**2)
+total_energy = np.sum(hermite_basis**2)
+edge_ratio = edge_energy / total_energy
+
+print(f"  [Check] 边缘能量占比: {edge_ratio:.2e}")
+if edge_ratio < 1e-4:
+    print("  ✅ 波形在窗口内自然衰减，无截断！")
+else:
+    print("  ⚠️ 警告：波形截断依然存在，请增大 Sigma！")
+
+# 再次QR分解确保数值上的完美正交
+q, _ = np.linalg.qr(hermite_basis.T)
+hermite_basis_ortho = q.T
+
+# ==========================================
+# 3. 信号定义
+# ==========================================
+def get_waveform(orders, weights):
+    wf = np.zeros(Nr)
+    for o, w in zip(orders, weights):
+        wf += w * hermite_basis_ortho[o, :]
+    wf = wf / np.sqrt(np.sum(wf**2)) # 能量归一化
+    return wf.astype(np.complex128) * np.exp(1j * 2 * np.pi * fc * t_pulse)
+
+# 发射波形
+sparse_wf = get_waveform(sparse_orders, [1.0, 0.9, 0.8, 0.7, 0.6])
+
+# LFM 干扰波形
+K_lfm = B / Tp
+lfm_wf = np.exp(1j * np.pi * K_lfm * t_pulse**2) * np.exp(1j * 2 * np.pi * fc * t_pulse)
+lfm_wf = lfm_wf / np.sqrt(np.sum(np.abs(lfm_wf)**2))
+
+# ==========================================
+# 4. 稀疏滤波器
+# ==========================================
+def apply_filter(rx_sig, orders_to_keep):
+    # 下变频
+    bb = rx_sig * np.exp(-1j * 2 * np.pi * fc * t_pulse)
+    # 分解
+    coeffs = np.dot(hermite_basis_ortho, bb)
+    # 滤波
+    mask = np.zeros_like(coeffs)
+    mask[orders_to_keep] = 1.0
+    coeffs_filtered = coeffs * mask
+    # 重构
+    bb_recon = np.dot(hermite_basis_ortho.T, coeffs_filtered)
+    # 上变频
+    return bb_recon * np.exp(1j * 2 * np.pi * fc * t_pulse)
+
+# 验证 LFM 抑制能力
+lfm_filtered = apply_filter(lfm_wf, sparse_orders)
+rejection = 10 * np.log10(np.sum(np.abs(lfm_filtered)**2) / np.sum(np.abs(lfm_wf)**2))
+print(f"  [Check] LFM 干扰抑制比 (Theoretical): {-rejection:.1f} dB (预期 > 15dB)")
+
+# ==========================================
+# 5. 回波生成与处理 (2D Simulation)
+# ==========================================
+print_section("3. 开始 2D 仿真 (BPA Imaging)")
+
+# 场景
+targets = [{'x': 0, 'y': 0, 'rcs': 1.0}]
+jammers = [{'x': -30, 'y': 20, 'power': 100.0}] # JSR = 20dB
+
+# 扩展参数
+range_swath = 200
+Nr_ext = Nr * 3
+dr = range_swath / Nr_ext
+eta = np.arange(Na) / PRF - Na/(2*PRF)
+platform_x = V * eta
+gr_center = np.sqrt(R0**2 - H**2)
+
+# --- 生成回波 ---
+def gen_echo(wf, use_jam):
+    echo = np.zeros((Na, Nr_ext), dtype=np.complex128)
+    freq = np.fft.fftfreq(Nr_ext, d=1/fs)
+    
+    # 扩展波形以便FFT移位
+    wf_pad = np.zeros(Nr_ext, dtype=np.complex128)
+    wf_pad[:Nr] = wf
+    wf_spec = np.fft.fft(wf_pad)
+    
+    # 干扰使用 LFM
+    lfm_pad = np.zeros(Nr_ext, dtype=np.complex128)
+    lfm_pad[:Nr] = lfm_wf
+    lfm_spec = np.fft.fft(lfm_pad)
+
+    for i in range(Na):
+        px = platform_x[i]
+        
+        # Target
+        for t in targets:
+            R = np.sqrt((px - t['x'])**2 + (gr_center + t['y'])**2 + H**2)
+            delay = (R - (R0 - range_swath/2)) / (c/2)
+            shift_phase = np.exp(-1j * 2 * np.pi * freq * delay)
+            phase_hist = np.exp(-1j * 4 * np.pi * R / wavelength)
+            echo[i] += t['rcs'] * np.fft.ifft(wf_spec * shift_phase) * phase_hist
+
+        # Jammer
+        if use_jam:
+            for j in jammers:
+                R = np.sqrt((px - j['x'])**2 + (gr_center + j['y'])**2 + H**2)
+                delay = (R - (R0 - range_swath/2)) / (c/2)
+                shift_phase = np.exp(-1j * 2 * np.pi * freq * delay)
+                phase_hist = np.exp(-1j * 4 * np.pi * R / wavelength)
+                # 干扰总是发射 LFM
+                echo[i] += np.sqrt(j['power']) * np.fft.ifft(lfm_spec * shift_phase) * phase_hist
+                
+    return echo
+
+print("  生成回波: Sparse + JSR 20dB...")
+echo_raw = gen_echo(sparse_wf, use_jam=True)
+echo_clean_ref = gen_echo(sparse_wf, use_jam=False) # 用于计算真实增益
+
+# --- 滤波与压缩 ---
+print("  执行稀疏滤波与距离压缩...")
+rc_data = np.zeros_like(echo_raw)
+window = np.hanning(Nr)
+
+for i in range(Na):
+    # 滑动窗口滤波
+    sig_long = echo_raw[i]
+    sig_out = np.zeros_like(sig_long)
+    
+    # 简单分段处理 (Overlap-Add simplified)
+    # 为演示，直接对整个脉冲串做分段滤波是比较慢的，这里我们简化：
+    # 假设回波主要集中在中间，直接对有效段滤波
+    # 在实际雷达中是逐脉冲处理。这里我们扫描强点。
+    
+    # 更好的方法：直接对长信号切片滤波
+    for k in range(0, Nr_ext - Nr, Nr//2):
+        chunk = sig_long[k:k+Nr]
+        chunk_f = apply_filter(chunk, sparse_orders)
+        sig_out[k:k+Nr] += chunk_f * window
+        
+    # 匹配滤波
+    rc_data[i] = correlate(sig_out, sparse_wf, mode='same')
+
+# 对照组：LFM受到干扰
+print("  生成对照组 (LFM 受干扰)...")
+echo_lfm_jam = gen_echo(lfm_wf, use_jam=True)
+rc_lfm = np.zeros_like(echo_lfm_jam)
+for i in range(Na):
+    rc_lfm[i] = correlate(echo_lfm_jam[i], lfm_wf, mode='same')
+
+# ==========================================
+# 6. BPA 成像 (线性插值)
+# ==========================================
+print_section("4. BPA 成像")
+
+def bpa(rc_in):
+    Nx, Ny = 60, 60
+    img = np.zeros((Ny, Nx), dtype=np.complex128)
+    x_vec = np.linspace(-40, 40, Nx)
+    y_vec = np.linspace(-40, 40, Ny)
+    
+    for i in range(Na):
+        px = platform_x[i]
+        for iy, y in enumerate(y_vec):
+            for ix, x in enumerate(x_vec):
+                R = np.sqrt((px - x)**2 + (gr_center + y)**2 + H**2)
+                bin_idx = (R - (R0 - range_swath/2)) / dr
+                
+                # 线性插值
+                idx_low = int(np.floor(bin_idx))
+                w = bin_idx - idx_low
+                if 0 <= idx_low < Nr_ext - 1:
+                    val = (1-w)*rc_in[i, idx_low] + w*rc_in[i, idx_low+1]
+                    img[iy, ix] += val * np.exp(1j * 4 * np.pi * R / wavelength)
+    return x_vec, y_vec, img
+
+print("  重建图像 LFM (Jammed)...")
+_, _, img_lfm = bpa(rc_lfm)
+print("  重建图像 Sparse (Filtered)...")
+x_axis, y_axis, img_sparse = bpa(rc_data)
+
+# ==========================================
+# 7. 结果可视化
+# ==========================================
+print_section("5. 结果对比")
+
+def get_db(img):
+    return 20*np.log10(np.abs(img)/np.max(np.abs(img)) + 1e-6)
+
+# 计算 SCR (Signal to Clutter/Jammer Ratio)
+# 目标在 (0,0)，干扰在 (-30, 20)
+def calc_scr(img, x_ax, y_ax):
+    # 目标能量 (中心 3x3 区域)
+    ix_t = np.argmin(np.abs(x_ax - 0))
+    iy_t = np.argmin(np.abs(y_ax - 0))
+    sig_pow = np.mean(np.abs(img[iy_t-1:iy_t+2, ix_t-1:ix_t+2])**2)
+    
+    # 干扰能量
+    ix_j = np.argmin(np.abs(x_ax - (-30)))
+    iy_j = np.argmin(np.abs(y_ax - 20))
+    jam_pow = np.mean(np.abs(img[iy_j-1:iy_j+2, ix_j-1:ix_j+2])**2)
+    
+    return 10*np.log10(sig_pow / (jam_pow + 1e-10))
+
+scr_lfm = calc_scr(img_lfm, x_axis, y_axis)
+scr_sparse = calc_scr(img_sparse, x_axis, y_axis)
+
+print(f"  LFM 图像信干比 (SCR): {scr_lfm:.2f} dB")
+print(f"  Sparse 图像信干比 (SCR): {scr_sparse:.2f} dB")
+print(f"  >>> 最终提升 (Improvement): {scr_sparse - scr_lfm:.2f} dB <<<")
+
+# 绘图
+plt.figure(figsize=(12, 5))
+
+plt.subplot(1, 2, 1)
+plt.imshow(get_db(img_lfm), extent=[-40,40,-40,40], cmap='jet', vmin=-30, vmax=0, origin='lower')
+plt.colorbar(label='dB')
+plt.title(f'LFM (Jammed)\nSCR = {scr_lfm:.1f} dB')
+plt.xlabel('Azimuth (m)')
+plt.ylabel('Range (m)')
+plt.scatter(0, 0, c='w', marker='o', label='Target')
+plt.scatter(-30, 20, c='r', marker='x', label='Jammer')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.imshow(get_db(img_sparse), extent=[-40,40,-40,40], cmap='jet', vmin=-30, vmax=0, origin='lower')
+plt.colorbar(label='dB')
+plt.title(f'Sparse Hermite (Filtered)\nSCR = {scr_sparse:.1f} dB')
+plt.xlabel('Azimuth (m)')
+plt.scatter(0, 0, c='w', marker='o')
+plt.scatter(-30, 20, c='r', marker='x')
+
+plt.tight_layout()
+plt.savefig('sar_final_result.png')
+print("✅ 结果已保存: sar_final_result.png")
+\end{lstlisting}
+
+
+抗干扰原理仿真
+
+\begin{lstlisting}
+    # -*- coding: utf-8 -*-
+"""
+SAR抗干扰仿真 - 深度理论分析版 
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import correlate, windows
+import warnings
+
+# 忽略除零警告
+warnings.filterwarnings('ignore')
+plt.style.use('dark_background')
+
+def print_section(title):
+    print(f"\n{'='*70}")
+    print(f" {title}")
+    print(f"{'='*70}")
+
+# ==========================================
+# 1. 系统参数
+# ==========================================
+print_section("1. 系统参数")
+
+c = 299792458.0
+fc = 5.3e9
+wavelength = c / fc
+B = 80e6
+fs = 200e6
+Tp = 5e-6
+Nr = int(Tp * fs)
+t_pulse = np.linspace(-Tp/2, Tp/2, Nr)
+
+# SAR 参数
+H = 5000.0
+V = 100.0
+R0 = 10000.0
+PRF = 400.0
+Na = 128
+Tsa = Na / PRF
+range_res = c / (2 * B)
+azimuth_res = wavelength * R0 / (2 * V * Tsa)
+
+print(f"  距离分辨率: {range_res:.2f} m")
+print(f"  方位分辨率: {azimuth_res:.2f} m")
+
+# ==========================================
+# 2. 物理归一化 Hermite 基底生成
+# ==========================================
+print_section("2. 波形理论分析 (Waveform Theory)")
+
+max_order = 60 # 进一步增加阶数以观察高阶LFM分量
+sparse_orders = [10, 18, 27, 36, 45] # 我方使用的稀疏阶数
+
+# 动态计算 Sigma
+x_max_needed = np.sqrt(2 * max_order + 1) + 4.5
+sigma = x_max_needed / (Tp / 2)
+t_scaled = t_pulse * sigma
+
+print(f"  [Theory] Sigma: {sigma:.2e} Hz")
+
+# --- 递推生成归一化函数 ---
+hermite_basis = np.zeros((max_order + 1, Nr))
+norm_factor = np.pi**(-0.25)
+hermite_basis[0, :] = norm_factor * np.exp(-t_scaled**2 / 2)
+hermite_basis[1, :] = np.sqrt(2) * t_scaled * hermite_basis[0, :]
+
+for n in range(2, max_order + 1):
+    c1 = np.sqrt(2.0 / n)
+    c2 = np.sqrt((n - 1.0) / n)
+    hermite_basis[n, :] = c1 * t_scaled * hermite_basis[n-1, :] - c2 * hermite_basis[n-2, :]
+
+# 再次QR分解确保数值上的完美正交
+q, _ = np.linalg.qr(hermite_basis.T)
+hermite_basis_ortho = q.T
+
+# --- 理论分析图表 1: 基函数形态 ---
+plt.figure(figsize=(12, 8))
+plt.subplot(2, 2, 1)
+for o in [0, 5, 10, 20]:
+    plt.plot(t_pulse*1e6, hermite_basis_ortho[o, :], label=f'Order {o}')
+plt.title('Hermite Basis Functions (Time Domain)')
+plt.xlabel('Time (us)')
+plt.legend(fontsize='small')
+plt.grid(alpha=0.3)
+
+# --- 理论分析图表 2: 正交性矩阵 ---
+# 计算 H * H.T，应该是单位阵
+ortho_mat = np.dot(hermite_basis_ortho, hermite_basis_ortho.T)
+plt.subplot(2, 2, 2)
+plt.imshow(np.abs(ortho_mat), cmap='gray', vmin=0, vmax=0.1) # 故意调低vmax看噪声
+plt.colorbar()
+plt.title('Orthogonality Matrix (H * H^T)\nIdeally Black (0) off-diagonal')
+plt.xlabel('Order m')
+plt.ylabel('Order n')
+
+# ==========================================
+# 3. 信号与LFM投影分析
+# ==========================================
+def get_waveform(orders, weights):
+    wf = np.zeros(Nr)
+    for o, w in zip(orders, weights):
+        wf += w * hermite_basis_ortho[o, :]
+    wf = wf / np.sqrt(np.sum(wf**2))
+    return wf.astype(np.complex128) * np.exp(1j * 2 * np.pi * fc * t_pulse)
+
+sparse_wf = get_waveform(sparse_orders, [1.0, 1.0, 1.0, 1.0, 1.0])
+
+# LFM 波形
+K_lfm = B / Tp
+lfm_wf = np.exp(1j * np.pi * K_lfm * t_pulse**2) * np.exp(1j * 2 * np.pi * fc * t_pulse)
+lfm_wf = lfm_wf / np.sqrt(np.sum(np.abs(lfm_wf)**2))
+
+# --- 理论分析图表 3: LFM 的“指纹” (投影系数) ---
+# 将 LFM 投影到 Hermite 基底上，看看它的能量去哪了
+lfm_baseband = lfm_wf * np.exp(-1j * 2 * np.pi * fc * t_pulse)
+lfm_coeffs = np.dot(hermite_basis_ortho, lfm_baseband)
+lfm_energy_dist = np.abs(lfm_coeffs)**2
+
+plt.subplot(2, 1, 2)
+plt.bar(range(max_order+1), lfm_energy_dist, color='red', alpha=0.6, label='LFM Jammer Energy')
+plt.scatter(sparse_orders, [lfm_energy_dist[o] for o in sparse_orders], color='yellow', s=50, zorder=5, label='Collision (Leakage)')
+for o in sparse_orders:
+    plt.axvline(x=o, color='lime', linestyle='--', alpha=0.5)
+plt.title('Why Filtering Works: LFM Energy Distribution vs Sparse Orders')
+plt.xlabel('Hermite Order')
+plt.ylabel('Energy')
+plt.legend()
+plt.tight_layout()
+plt.savefig('theory_analysis.png')
+print("✅ 保存理论分析图: theory_analysis.png")
+
+# 计算 LFM 在我方阶数上的残留
+leakage_energy = np.sum(lfm_energy_dist[sparse_orders])
+total_lfm_energy = np.sum(lfm_energy_dist)
+print(f"  [Theory] LFM 投射到基底的总能量占比: {total_lfm_energy:.4f} (越接近1说明分解越完备)")
+print(f"  [Theory] LFM 在稀疏阶数上的残留(Leakage): {leakage_energy:.4f}")
+print(f"  [Theory] 理论干扰抑制极限: {-10*np.log10(leakage_energy):.2f} dB")
+
+# ==========================================
+# 4. 稀疏滤波器 (带加窗)
+# ==========================================
+def apply_filter(rx_sig, orders_to_keep):
+    bb = rx_sig * np.exp(-1j * 2 * np.pi * fc * t_pulse)
+    coeffs = np.dot(hermite_basis_ortho, bb)
+    
+    mask = np.zeros_like(coeffs)
+    mask[orders_to_keep] = 1.0
+    
+    # 软阈值处理 (Soft Thresholding) - 可选，这里先用硬阈值
+    coeffs_filtered = coeffs * mask
+    
+    bb_recon = np.dot(hermite_basis_ortho.T, coeffs_filtered)
+    return bb_recon * np.exp(1j * 2 * np.pi * fc * t_pulse)
+
+# ==========================================
+# 5. 2D 仿真与噪声溯源
+# ==========================================
+print_section("3. 2D 仿真与噪声溯源")
+
+# 场景：将干扰移到更显著的位置，方便观察
+targets = [{'x': 0, 'y': 0, 'rcs': 1.0}]
+jammers = [{'x': -20, 'y': 20, 'power': 100.0}] # JSR = 20dB
+
+# 扩展参数
+range_swath = 200
+Nr_ext = Nr * 3
+dr = range_swath / Nr_ext
+eta = np.arange(Na) / PRF - Na/(2*PRF)
+platform_x = V * eta
+gr_center = np.sqrt(R0**2 - H**2)
+
+# 通用回波生成器
+def gen_echo_core(wf, obj_list, is_jammer=False):
+    echo = np.zeros((Na, Nr_ext), dtype=np.complex128)
+    freq = np.fft.fftfreq(Nr_ext, d=1/fs)
+    
+    # 信号准备
+    sig_pad = np.zeros(Nr_ext, dtype=np.complex128)
+    sig_pad[:Nr] = wf
+    sig_spec = np.fft.fft(sig_pad)
+    
+    for i in range(Na):
+        px = platform_x[i]
+        for obj in obj_list:
+            R = np.sqrt((px - obj['x'])**2 + (gr_center + obj['y'])**2 + H**2)
+            delay = (R - (R0 - range_swath/2)) / (c/2)
+            
+            # 频域时延
+            shift_phase = np.exp(-1j * 2 * np.pi * freq * delay)
+            phase_hist = np.exp(-1j * 4 * np.pi * R / wavelength)
+            
+            amp = np.sqrt(obj['power']) if is_jammer else obj['rcs']
+            echo[i] += amp * np.fft.ifft(sig_spec * shift_phase) * phase_hist
+    return echo
+
+print("  生成各类回波...")
+# 1. 仅目标回波 (Sparse)
+echo_tgt = gen_echo_core(sparse_wf, targets, is_jammer=False)
+# 2. 仅干扰回波 (LFM)
+echo_jam = gen_echo_core(lfm_wf, jammers, is_jammer=True)
+# 3. 混合回波
+echo_mix = echo_tgt + echo_jam
+
+# 处理函数
+def process_sar(raw_echo, use_filter=True):
+    # 1. 滤波 (可选)
+    processed_echo = np.zeros_like(raw_echo)
+    if use_filter:
+        window_func = np.hanning(Nr) # 时域窗
+        for i in range(Na):
+            # 分段滤波简化版：直接对有效段滤波
+             for k in range(0, Nr_ext - Nr, Nr//2):
+                chunk = raw_echo[i, k:k+Nr]
+                chunk_f = apply_filter(chunk, sparse_orders)
+                # OLA (Overlap-Add) process would be here, simplifying for demo:
+                processed_echo[i, k:k+Nr] += chunk_f * window_func
+    else:
+        processed_echo = raw_echo
+
+    # 2. 距离压缩 (带Taylor窗抑制旁瓣)
+    rc_out = np.zeros_like(processed_echo)
+    # 生成频域 Taylor 窗 (或者简单的 Kaiser/Hamming)
+    # 为了简单且有效，使用 Kaiser, beta=6 (旁瓣~-60dB)
+    freq_win = windows.kaiser(Nr, beta=6)
+    
+    # 参考信号频谱
+    ref_spec = np.fft.fft(sparse_wf, n=Nr_ext) 
+    
+    for i in range(Na):
+        # 频域匹配滤波
+        echo_spec = np.fft.fft(processed_echo[i])
+        # 匹配滤波 = Echo * Ref_Conj
+        # 加窗: 在频域乘窗函数 (近似) 或在时域相关后加窗
+        # 这里使用标准时域相关
+        corr = correlate(processed_echo[i], sparse_wf, mode='same')
+        rc_out[i] = corr
+        
+    return rc_out
+
+print("  信号处理 (Filtering + Compression)...")
+rc_tgt_only = process_sar(echo_tgt, use_filter=True)
+rc_jam_only = process_sar(echo_jam, use_filter=True)
+rc_mix_final = process_sar(echo_mix, use_filter=True)
+
+# LFM 对照组
+rc_lfm_ref = np.zeros_like(echo_mix)
+for i in range(Na):
+    rc_lfm_ref[i] = correlate(echo_jam[i] + echo_tgt[i], lfm_wf, mode='same')
+
+
+# ==========================================
+# 6. BPA 成像
+# ==========================================
+print_section("4. BPA 成像诊断")
+
+def bpa_fast(rc_in):
+    Nx, Ny = 80, 80
+    img = np.zeros((Ny, Nx), dtype=np.complex128)
+    x_vec = np.linspace(-50, 50, Nx)
+    y_vec = np.linspace(-50, 50, Ny)
+    
+    # 预计算
+    rr, xx = np.meshgrid(y_vec, x_vec, indexing='ij') # Pixel coordinates
+    # rr is relative y (ground range offset), xx is azimuth
+    
+    for i in range(Na):
+        px = platform_x[i]
+        
+        # 矢量化计算距离矩阵
+        dist_mat = np.sqrt((px - xx)**2 + (gr_center + rr)**2 + H**2)
+        
+        # 转换到 Range Bin Index
+        bin_mat = (dist_mat - (R0 - range_swath/2)) / dr
+        
+        # 线性插值取样
+        idx_floor = np.floor(bin_mat).astype(int)
+        w = bin_mat - idx_floor
+        
+        # 边界掩模
+        mask = (idx_floor >= 0) & (idx_floor < Nr_ext - 1)
+        
+        # 累积
+        if np.any(mask):
+            val0 = rc_in[i, idx_floor[mask]]
+            val1 = rc_in[i, idx_floor[mask] + 1]
+            interp_val = (1 - w[mask]) * val0 + w[mask] * val1
+            
+            phase_corr = np.exp(1j * 4 * np.pi * dist_mat[mask] / wavelength)
+            img[mask] += interp_val * phase_corr
+            
+    return x_vec, y_vec, img
+
+print("  重建图像: 仅目标 (检查PSF)...")
+x, y, img_tgt = bpa_fast(rc_tgt_only)
+
+print("  重建图像: 仅干扰 (检查残留噪声分布)...")
+_, _, img_jam = bpa_fast(rc_jam_only)
+
+print("  重建图像: 混合最终结果...")
+_, _, img_mix = bpa_fast(rc_mix_final)
+
+# ==========================================
+# 7. 结果展示
+# ==========================================
+def db_norm(img):
+    return 20 * np.log10(np.abs(img) / np.max(np.abs(img_mix)) + 1e-6)
+
+plt.figure(figsize=(15, 5))
+
+# 1. 仅目标 (Ideal PSF)
+plt.subplot(1, 3, 1)
+plt.imshow(db_norm(img_tgt), extent=[-50,50,-50,50], cmap='jet', vmin=-40, vmax=0, origin='lower')
+plt.title('Target Only (Ideal Response)')
+plt.xlabel('Azimuth (m)')
+plt.ylabel('Range (m)')
+plt.colorbar(label='dB')
+
+# 2. 仅干扰 (Noise Source)
+plt.subplot(1, 3, 2)
+# 注意：这里归一化用的是混合图像的最大值，这样能反映干扰相对于目标的真实强度
+plt.imshow(20 * np.log10(np.abs(img_jam) / np.max(np.abs(img_mix)) + 1e-6), 
+           extent=[-50,50,-50,50], cmap='jet', vmin=-40, vmax=0, origin='lower')
+plt.title('Jammer Only (Residual Noise)')
+plt.xlabel('Azimuth (m)')
+plt.scatter(jammers[0]['x'], jammers[0]['y'], c='r', marker='x', label='Jammer Pos')
+plt.legend()
+plt.colorbar(label='dB')
+
+# 3. 最终结果
+plt.subplot(1, 3, 3)
+plt.imshow(db_norm(img_mix), extent=[-50,50,-50,50], cmap='jet', vmin=-40, vmax=0, origin='lower')
+plt.title('Final Image (Target + Filtered Jammer)')
+plt.xlabel('Azimuth (m)')
+plt.colorbar(label='dB')
+
+plt.tight_layout()
+plt.savefig('sar_noise_analysis.png')
+print("✅ 保存噪声溯源图: sar_noise_analysis.png")
+
+# 文本分析
+jam_peak_residual = np.max(np.abs(img_jam))
+tgt_peak = np.max(np.abs(img_tgt))
+final_scr = 20*np.log10(tgt_peak / jam_peak_residual)
+
+print_section("6. 深度诊断结论")
+print(f"  目标峰值强度: {tgt_peak:.2f}")
+print(f"  干扰残留峰值: {jam_peak_residual:.2f}")
+print(f"  实际 SCR: {final_scr:.2f} dB")
+print("  诊断指导:")
+print("  1. 如果中间图(Jammer Only)有明显亮线或光斑，说明那些区域是LFM残留导致的。")
+print("  2. 如果中间图是均匀的雪花噪声，说明是滤波后的白噪声残留。")
+print("  3. 观察左下角(-50, -50)在中间图中是否发亮，如果是，那就是干扰的旁瓣泄露到了那里。")
+\end{lstlisting}

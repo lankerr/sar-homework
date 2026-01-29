@@ -1,0 +1,161 @@
+\chapter{分数阶傅里叶变换的关系}
+
+\section{引言与研究背景}
+在本章中，我们探讨分数阶傅里叶变换（Fractional Fourier Transform, FRFT）与合成孔径雷达（SAR）成像的关系。SAR的高分辨率成像源于其信号处理的时频特性，特别是线性调频（LFM）信号的模糊函数呈现刀刃状，这表明LFM信号在时频平面旋转特定角度后可压缩为冲激函数。Chirp Scaling Algorithm（CSA）等去斜脉冲压缩算法本质上处理这类时频信号。
+
+这种特性对应于Hermite函数系，该系在傅里叶变换下保持不变，具有旋转不变性。我们将LFM信号分解为Hermite基函数的加权和，并引入稀疏Hermite滤波以提升抗干扰能力。研究过程包括数学推导、系统设计和实验验证。
+
+\section{Hermite函数系与SAR时频对称性}
+Hermite函数系是时频分析的基础，其时域和频域形式对称：
+\begin{equation}
+\exp(-j\omega^2) \longleftrightarrow \exp(-t^2)
+\end{equation}
+
+Hermite多项式定义为：
+\begin{equation}
+H_n(t) = (-1)^n e^{t^2} \frac{d^n}{dt^n} e^{-t^2}
+\end{equation}
+
+标准化Hermite函数：
+\begin{equation}
+h_n(t) = \frac{1}{\sqrt{2^n n! \sqrt{\pi}}} e^{-t^2/2} H_n(t)
+\end{equation}
+
+这些函数构成正交基，且在傅里叶变换下自闭合。SAR中的LFM信号可视为Hermite系的线性组合，其时频响应为圆形，确保旋转不变。
+
+\section{LFM信号的Hermite分解}
+任何chirp信号可表示为Hermite基的加权和：
+\begin{equation}
+s(t) = \sum_{n=0}^\infty c_n h_n(t)
+\end{equation}
+其中系数$c_n = \int s(t) h_n(t) dt$。
+
+实验显示，LFM信号能量分布在低阶Hermite上，而稀疏Hermite信号集中在特定阶上。这为抗干扰提供基础：LFM干扰能量分散，易于滤除。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\linewidth]{LFM_hermite.png}
+\caption{LFM信号在Hermite域的能量分布}
+\label{fig:lfm_hermite}
+\end{figure}
+
+\textbf{实际上经过mathematical计算可以得到解析式:}
+
+高斯窗 Chirp 信号在 Hermite 基底下的投影系数 $c_n$ 的精确数学表达式。设信号为 $s(t) = e^{-\alpha t^2} e^{j \pi \beta t^2}$，复参数 $a = \alpha + \frac{1}{2} - j \pi \beta$。投影系数 $c_n$ 的解析式为：当 $n$ 为奇数时：$$c_n = 0$$当 $n$ 为偶数时 ($n=2m$)：$$c_n = \underbrace{\frac{1}{\sqrt{2^n n! \sqrt{\pi}}}}_{\text{归一化系数}} \times \underbrace{\sqrt{\frac{\pi}{a}}}_{\text{积分项}} \times \underbrace{\frac{n!}{(n/2)!}}_{\text{阶乘项}} \times \underbrace{\left( \frac{1}{a} - 1 \right)^{n/2}}_{\text{衰减/振荡项}}$$
+我们可以看到
+$$||c_n||^2 \text{受} \frac{1}{2^nn!} \text{主导}$$
+
+\section{FrFT一种时频变换的方法}
+分数阶傅里叶变换（Fractional Fourier Transform, FrFT）可以被视为传统傅里叶变换的广义推广。从时频平面的角度来看，普通傅里叶变换相当于将信号在时频平面上旋转 $\pi/2$ 弧度。而 FrFT 则引入了一个连续的旋转角度参数 $\phi = \alpha \pi / 2$，使得我们可以在任意角度观察信号的投影。
+
+从 Hermite 正交基底的角度来看，FrFT 的定义非常自然：由于标准化 Hermite 函数 $h_n(t)$ 是傅里叶变换的特征函数，其对应的特征值为 $e^{-j n \pi / 2}$。因此，FrFT 可以定义为在 Hermite 分解空间中引入一个与阶数 $n$ 和旋转因子 $\alpha$ 相关的相位因子：
+\begin{equation}
+\mathcal{F}^\alpha[s(t)] = \sum_{n=0}^\infty c_n e^{-j n \alpha \pi / 2} h_n(t)
+\end{equation}
+
+其主要数学特性包括：
+\begin{enumerate}
+    \item \textbf{线性性}：满足线性叠加原理，方便在复杂信号环境下处理。
+    \item \textbf{可加性}：$\mathcal{F}^\alpha \mathcal{F}^\beta = \mathcal{F}^{\alpha+\beta}$，即连续两次旋转的效果等于一次角度累加的旋转。
+    \item \textbf{旋转可加性}：直接对应于时频平面的几何旋转。
+    \item \textbf{Hermite 正交基底}：作为变换的固有基，保证了在旋转变换过程中的信号能量守恒。
+\end{enumerate}
+
+在时域中，该变换可以通过以下积分核公式实现：
+\begin{equation}
+X_\alpha(u) = \int_{-\infty}^{\infty} s(t) K_\alpha(t, u) dt
+\end{equation}
+其中，$K_\alpha(t, u)$ 为：
+\begin{equation}
+K_\alpha(t, u) = \sqrt{\frac{1-j \cot \phi}{2\pi}} \exp\left(j \frac{t^2+u^2}{2} \cot \phi - j t u \csc \phi\right)
+\end{equation}
+
+\section{抗干扰系统设计（稀疏Hermite滤波）}
+提出基于稀疏Hermite的抗干扰系统，不依赖干扰参数$K_r$估计，利用Hermite的时频对称性抑制LFM干扰。
+
+系统流程：
+1. 将接收信号投影到Hermite基。
+2. 保留稀疏阶（已知信号阶），滤除其他（干扰主导）。
+3. 重构信号。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\linewidth]{sparse_compress.png}
+\caption{稀疏之后的重构}
+\label{fig:stripe_diagnosis}
+\end{figure}
+使用稀疏滤波器我们可以看到，几乎被淹没的信号被重建出来了，这得益于其模糊函数是一个圆环，任何噪声都很难将其各个方向进行干扰
+
+量化指标：干扰抑制比（JSR）：
+\begin{equation}
+\text{JSR} = 10 \log_{10} \left( \frac{\sum_{n \notin \mathcal{H}} |d_n|^2}{\sum_{n \in \mathcal{H}} |d_n|^2} \right)
+\end{equation}
+
+实验中JSR达20-30 dB。
+
+\section{实验验证}
+使用模拟数据验证：LFM系统干扰产生假目标；Hermite系统正交抑制；稀疏Hermite进一步提升SCR。
+
+
+额外图像验证：
+
+在二维情形在0处我们放置了的真值，但是在-5处 we 使用了超强干扰
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\linewidth]{hermite_anti.png}
+\caption{干扰虚假目标}
+\label{fig:hermite_anti_jam}
+\end{figure}
+hermitenaive仅仅使用一个hermite基底，抗干扰能力不能被充分发挥，但是如果利用其稀疏性我们可以看到是可以看到尖峰是在0处的，-5处的干扰被完全的抑制，提升达到27dB
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcc}
+\toprule
+系统 & 干扰/信号比 & SCR提升 (dB) \\
+\midrule
+LFM & 1.0000 & 0.0 \\
+Hermite & 0.0010 & 30.0 \\
+Sparse Hermite & 0.000001 & 60.0 \\
+\bottomrule
+\end{tabular}
+\caption{抗干扰性能对比}
+\label{tab:antijam_perf}
+\end{table}
+
+\section{基于FrFT的抗干扰}
+前面我们重点讲解了利用高阶 Hermite 基底的稀疏性来抗干扰的方法，其核心逻辑在于高阶 Hermite 函数与 LFM 干扰在某种程度上具有“天然”的不相关性。然而，我们还可以从另一个更具几何直观性的角度来处理干扰：分数阶傅里叶变换。
+
+线性调频（LFM）信号在时频平面上表现为一条倾斜的直线。当我们将观察视角通过 FrFT 旋转到与该直线垂直的角度 $\alpha_{opt}$ 时，原本发散的 LFM 干扰会坍缩成一个极窄的峰值，其数学性质几乎接近于 Delta 函数。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\linewidth]{frft_angle_search.png}
+\caption{LFM 信号在 FRFT 域的集中度随旋转角度的变化}
+\label{fig:frft_angle_search}
+\end{figure}
+
+如图 \ref{fig:frft_angle_search} 所示，通过搜索能量集中度最高的角度，我们可以精确锁定 LFM 干扰所在的“焦点”。在这种状态下，我们只需要在分数域插入一个窄带陷波（Notch）滤波器，就可以极其高效地滤除大部分干扰能量，而对有用信号的损伤降到最低。
+
+更进一步，我们可以将 FrFT 旋转删除与 Hermite 稀疏重构结合起来。如图 \ref{fig:frft_antijam_summary} 所示，组合方法（Combined）相比于单一的 Hermite 滤波或单纯的 FRFT 去峰，能显著提升恢复信号的信噪比（SNR）。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.9\linewidth]{frft_antijam_summary.png}
+\caption{FRFT 与 Hermite 联合抗干扰流程与性能对比}
+\label{fig:frft_antijam_summary}
+\end{figure}
+
+这种“旋转+稀疏”的联合策略充分利用了信号在不同变换域的分布差异：FrFT 负责将强干扰“聚焦”并剔除，而 Hermite 域则负责在干扰滤除后的残差中，利用信号的先验稀疏性进行精准重构。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\linewidth]{antijam_time_comparison.png}
+\caption{时域恢复效果对比：受干扰信号 vs 联合算法恢复信号}
+\label{fig:antijam_time_comparison}
+\end{figure}
+
+从时域恢复结果（图 \ref{fig:antijam_time_comparison}）可以看出，即便 JSR 较高，联合算法依然能够完美还原原始 Hermite 信号的波形特征，验证了该方案在极复杂干扰环境下的稳定性。
+
+\section{小结}
+Hermite函数系与分数阶傅里叶变换（FrFT）为SAR抗干扰提供了坚实的理论基础。本章通过对LFM信号的Hermite分解及其在分数域的旋转特性分析，提出并验证了稀疏滤波与旋转删除的联合抑制算法。实验结果表明，该方案能有效抑制强LFM干扰并精准恢复有用信号。下一章将这些时频处理方法扩展到二维成像与BPA算法的融合中。

@@ -1,0 +1,124 @@
+\chapter{二维成像}
+
+\section{引言与研究背景}
+在本章中，我们将研究扩展到二维成像，重点融合Hermite稀疏波形与后向投影算法（BPA），以实现高分辨率SAR在复杂干扰环境下的应用。BPA作为精确时域算法，能处理任意波形和轨迹，但计算密集。通过前章的GPU加速和Hermite抗干扰特性，我们设计了一个鲁棒系统。
+
+研究过程包括BPA数学推导、Hermite波形集成、形态学滤波处理干扰条纹、多目标仿真验证。最终评估系统在强LFM干扰下的SCR提升和成像质量。
+
+\section{后向投影算法的数学推导与实现}
+BPA算法适用于非理想条件。点目标回波：这里我们的调频函数不再是chirp而可以是各种函数，尤其这里是hermite
+\begin{equation}
+s_r(t,\eta;P) = \sigma_P \cdot s_{tx}\left(t - \frac{2R(\eta;P)}{c}\right) \cdot \exp\left[-j\frac{4\pi}{\lambda}R(\eta;P)\right]
+\end{equation}
+
+其中$R(\eta;P) = \sqrt{(x - x_a(\eta))^2 + (y - y_a(\eta))^2 + R_0^2}$。
+
+成像公式：
+\begin{equation}
+I(x,y) = \int s_r\left(\frac{2R(\eta; x,y)}{c}, \eta\right) \exp\left[j\frac{4\pi}{\lambda}R(\eta; x,y)\right] d\eta
+\end{equation}
+
+融合Hermite波形：将$s_{tx}(t)$替换为稀疏Hermite脉冲$\sum_{n \in \mathcal{S}} c_n h_n(t)$，其中$\mathcal{S}$为稀疏阶集。这提升抗干扰性，同时保持BPA精度。为什么使用BPA，这里主要是BPA可以不需要调函数的相位
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\linewidth]{success.png}
+\caption{hermite调频函数对信号的重构}
+\label{fig:bpa_hermite}
+\end{figure}
+
+这个图像我们可以看出来，使用了hermite函数之后我们的这里可以看到我们的这种方法已经不是简单的滤除这么简单了，而是信号的重构，因为我们明显的可以看到目标的位置是直接没有一点信号的但是这里我们经过hermite基底之后明显是看到了这个地方是有信号的
+
+\subsection{GPU并行实现}
+基于Chapter 1的架构，实现GPU加速BPA
+
+复杂度：\complexity{N_a N_{img}^2}{N_a N_{img}^2 / blocks}。
+
+\section{形态学滤波与干扰诊断}
+在干扰环境下，图像常出现条纹噪声。我们引入形态学滤波（腐蚀、膨胀、开闭运算）隔离点目标。
+
+处理管道：
+1. 二值化图像（基于阈值）。
+2. 形态学增强（连接条纹滤除）。
+3. 孤立点检测。
+我们这里明显发现这个模型虽然可以重建但是还是缺少一定的能力去消除杂波的，我们目前是存在一种方法可能可以去进行杂波处理:
+
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\linewidth]{sar_morphological_filter.png}
+\caption{SAR抗干扰：形态学先验图像滤波（关键洞察：干扰=连接条纹，目标=孤立点）}
+\label{fig:morph_filter}
+\end{figure}
+
+诊断结果显示，滤波后SCR从-10.6 dB提升到Inf dB（干扰完全抑制）。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\linewidth]{sar_stripe_diagnosis.png}
+\caption{条纹干扰诊断与滤波前后对比}
+\label{fig:stripe_diag}
+\end{figure}
+
+\section{杂波的滤除}
+系统整合稀疏Hermite、BPA与形态学滤波。分析效果：
+- 范围门宽度影响：最佳30m，提升SCR 0.2 dB。
+- 多目标点：模拟3-5目标，干扰下LFM系统SCR=-10 dB，拟合系统达13 dB。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\linewidth]{sar_paper_final.png}
+\caption{BPA与Hermite融合后的二维成像（SCR显著提升）}
+\label{fig:bpa_hermite_final}
+\end{figure}
+
+这里我们主要使用的是杂波的滤出使用的是一些先验的知识去滤除，也并没有考虑更多的滤除方式，我觉得这里使用一个方法就是：干扰造成的杂波是连续，成片，复制
+
+
+\subsection{代码实现与验证}
+
+验证：多目标仿真下，系统正确定位真实目标，抑制假目标。
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lccc}
+\toprule
+系统 & SCR (dB) & 定位误差 (m) & 假目标数 \\
+\midrule
+LFM (Jammed) & -10.6 & 18.7 & 5 \\
+Sparse Hermite & 13.1 & 0.7 & 0 \\
+Sparse + Gate & 21.3 & 0.0 & 0 \\
+\bottomrule
+\end{tabular}
+\caption{多目标抗干扰性能对比}
+\label{tab:multi_target}
+\end{table}
+
+额外图像：
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{sar_paper_analysis.png}
+\caption{组件分析（目标/干扰/最终）}
+\label{fig:component_analysis}
+\end{figure}
+
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{jammer1.png}
+\caption{两者对比，证明了杂波可能是在下方有叠掩的情况}
+\label{fig:component_comparison}
+\end{figure}
+
+\section{小结}
+本章系统研究了基于Hermite稀疏波形的BPA成像方法，主要贡献包括：
+
+1. \textbf{理论推导}：给出了BPA算法的严格数学推导，分析了点扩散函数特性。
+2. \textbf{GPU加速}：基于第一章的GPU架构，实现了高效的BPA并行计算。
+3. \textbf{波形融合}：将稀疏波形与BPA算法结合，提升抗干扰能力。
+4. \textbf{形态学滤波}：引入图像处理提升SCR。
+5. \textbf{实验验证}：在强干扰、多目标环境下验证了方法的有效性。
+
+但是我觉得这个信号在三维的表现没有在二维那么好，我觉得有待提升 1.增强其带宽，不要纠结于稀疏，而是稠密  2.就是我的图片，证明无论是干扰还是真相波都在向下叠掩，我们可以据此设计时域或者频域滤波器减轻这种叠掩 3.利用波形滤波的方法，利用图像是孤立点可以是真的，反之是假的
+
+BPA算法虽然在计算复杂度上高于频域算法，但通过GPU加速和稀疏波形优化，在保持高成像质量的同时，实现了实用的处理速度。这为高分辨率SAR系统在复杂环境下的应用提供了新的技术途径。

@@ -1,0 +1,189 @@
+\chapter{SAR算法仿真}
+
+\section{引言与研究背景}
+在本章中，我们对合成孔径雷达（SAR）的正常仿真进行探讨，主要焦点是理想状态下的成像过程（无噪声环境）以及GPU在算法加速中的作用。SAR成像算法包括后向投影算法（BPA）、Chirp Scaling Algorithm（CSA）、Range Doppler Algorithm（RDA）和Omega-K Algorithm（wKA）。这些算法在不同场景下有各自的优势，其中BPA作为时域算法提供最高精度，但计算复杂度最高。通过GPU加速，我们可以显著提升其效率。
+
+研究过程从算法数学模型推导开始，逐步实现代码，并对比CPU与GPU性能。最后，分析理想条件下成像结果，并讨论噪声缺失导致的特定现象。
+
+\section{BPA算法的数学模型}
+BPA是一种精确的时域成像算法，适用于任意运动轨迹和波形。考虑发射信号$s_{tx}(t)$，点目标$P(x,y,0)$在方位时间$\eta$的回波为：
+\begin{equation}
+s_r(t,\eta;P) = \sigma_P \cdot s_{tx}\left(t - \frac{2R(\eta;P)}{c}\right) \cdot \exp\left[-j\frac{4\pi}{\lambda}R(\eta;P)\right]
+\end{equation}
+其中，斜距历程$R(\eta;P) = \sqrt{(x - x_a(\eta))^2 + (y - y_a(\eta))^2 + R_0^2}$。
+
+成像过程涉及对每个像素点累加补偿后的回波：
+\begin{equation}
+I(x,y) = \int s_r\left(\frac{2R(\eta;P)}{c}, \eta\right) \exp\left[j\frac{4\pi}{\lambda}R(\eta;P)\right] d\eta
+\end{equation}
+
+在理想无噪声条件下，点扩散函数（PSF）呈现清晰峰值，但由于相干积累完美，可能出现X形artifact。
+
+\section{GPU加速探究}
+BPA的计算复杂度为$O(N_a \times N_r \times N_{img}^2)$，CPU处理缓慢。通过GPU并行化像素循环，可显著加速。
+
+\subsection{代码实现与优化}
+以下是伪代码：
+\begin{algorithm}[H]
+\caption{Back-Projection Algorithm (BPA)}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Raw Data $D \in \mathbb{C}^{N_a \times N_r}$, Coordinates $Grid \in \mathbb{R}^{N_{img} \times N_{img}}$
+\State \textbf{Output:} Image $I$
+\State \cpuonly{Initialize image $I = 0$} \gpuacc{Allocate GPU memory}
+\For{each pulse $\eta = 1$ to $N_a$}
+    \For{each pixel $(x,y)$ in Grid \gpuacc{(parallel)}}
+        \State Compute range $R = \sqrt{(x - x_\eta)^2 + (y - y_\eta)^2 + R_0^2}$
+        \State Delay $\tau = 2R/c$
+        \State Interpolate $D(\eta, \tau)$
+        \State Phase compensate $\exp(j 4\pi R / \lambda)$
+        \State Accumulate to $I(x,y)$
+    \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+\complexity{N_a N_r N_{img}^2}{N_a N_r N_{img}^2 / threads}
+
+Python实现使用CuPy加速（关键片段）：
+\begin{lstlisting}
+import cupy as cp
+
+def bpa_gpu(raw_data, grid_x, grid_y, pos_a, lambda_, c):
+    raw_gpu = cp.array(raw_data)
+    img = cp.zeros((len(grid_x), len(grid_y)), dtype=cp.complex64)
+    
+    for eta in range(raw_data.shape[0]):
+        dx = grid_x - pos_a[eta, 0]
+        dy = grid_y - pos_a[eta, 1]
+        R = cp.sqrt(dx**2 + dy**2 + R0**2)
+        tau_idx = cp.round(2 * R / c * fs).astype(cp.int32)
+        phase = cp.exp(1j * 4 * cp.pi * R / lambda_)
+        valid = (tau_idx >= 0) & (tau_idx < raw_data.shape[1])
+        img[valid] += raw_gpu[eta, tau_idx[valid]] * phase[valid]
+    
+    return cp.asnumpy(img)
+\end{lstlisting}
+
+实验配置：Tesla T4 GPU，数据规模128x128到1024x1024。
+
+\subsection{性能对比}
+执行时间对比（单位：秒）：
+\begin{table}[H]
+\centering
+\begin{tabular}{lccc}
+\toprule
+算法 & CPU时间 & GPU时间 & 加速比 \\
+\midrule
+BPA & 10.253 & 0.079 & 129.8 \\
+CSA & 1.330 & 0.033 & 40.3 \\
+RDA & 1.793 & 0.942 & 1.9 \\
+wKA & 1.369 & 1.120 & 1.2 \\
+\bottomrule
+\end{tabular}
+\caption{GPU vs CPU 执行时间对比}
+\label{tab:gpu_perf}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\linewidth]{cpu_gpu_output.png}
+\caption{GPU vs CPU 执行时间条形图}
+\label{fig:gpu_comparison}
+\end{figure}
+
+
+
+\section{其他算法对比：CSA, RDA, wKA}
+- CSA：频域算法，处理距离徙动修正（RCMC），适用于线性轨迹。
+- RDA：结合距离多普勒，高效但需理想假设。
+- wKA：Omega-K算法，频域精确，修正频率依赖。
+
+理想条件下，所有算法产生类似图像，但BPA精度最高。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.8\linewidth]{cpu_gpu.png}
+\caption{GPU vs CPU 算法效率对比}
+\label{fig:gpu_comparison_perf}
+\end{figure}
+
+上面的BPA算法和wKA算法有着明显的条带，这实际上就是与点扩散函数有关系，或者也可以理解为BPA是沿着距离徙动曲线执行的，但是在信噪比稍微小些的条件下他们会运行的更好
+
+回波信号就生成就是使用课件的方法，这里不再赘述，并且生成经典的图像的时候，就是4000*1400的时候GPU比CPU快了30倍左右
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.75\linewidth]{echo_data.png}
+\caption{回波信号生成}
+\label{fig:echo_generation}
+\end{figure}
+
+\section{噪声影响分析}
+在无噪声理想状态下，成像清晰，但缺少噪声导致过完美相干积累，形成X形波带。这是因为距离徙动曲线（RCM）在无噪声时完美叠加。
+
+实际中，添加噪声可模拟真实场景（见附录代码）。
+
+\section{成像质量分析}
+
+\begin{table}[H]
+\centering
+\caption{各算法成像质量对比（中心目标）}
+\label{tab:imaging_quality}
+\begin{tabular}{|c|c|c|c|c|c|}
+\hline
+\textbf{算法} & \textbf{距离分辨率 (m)} & \textbf{理论偏差 (\%)} & \textbf{方位分辨率 (m)} & \textbf{理论偏差 (\%)} & \textbf{PSLR (dB)} \\ \hline
+BPA            & 1.88                  & +0.3\%                 & 0.142                   & +0.4\%                 & -13.2              \\ \hline
+RDA            & 1.94                  & +3.5\%                 & 0.145                   & +2.5\%                 & -12.9              \\ \hline
+CSA            & 1.92                  & +2.5\%                 & 0.144                   & +1.8\%                 & -13.1              \\ \hline
+wKA (修复)      & 1.89                  & +0.9\%                 & 0.143                   & +1.1\%                 & -13.3              \\ \hline
+\end{tabular}
+\end{table}
+
+\noindent 从表\ref{tab:imaging_quality}可以看出：
+\begin{itemize}
+    \item \textbf{理论分辨率：}距离=1.874 m，方位=0.1415 m
+    \item \textbf{BPA算法}表现出最佳的成像质量，距离和方位分辨率非常接近理论值（1.88 m和0.142 m，偏差均小于0.5\%）
+    \item \textbf{RDA算法}距离分辨率略有拓宽（1.94 m，偏差+3.5\%），这是由于RCMC插值带来的误差
+    \item \textbf{CSA算法}通过Chirp Scaling避免了RCMC插值，成像质量优于RDA（1.92 m和0.144 m，偏差均在3\%以内）
+    \item \textbf{wKA算法（修复版）}在修正了Stolt映射和相位补偿后，分辨率显著提升（1.89 m和0.143 m，偏差均小于2\%），达到了与BPA相当的精度
+    \item \textbf{PSLR指标：}所有算法的PSLR均在-12.9 dB至-13.3 dB之间，接近Sinc函数的理想值（-13.26 dB）
+\end{itemize}
+
+\noindent \textbf{综合评估：}
+\begin{itemize}
+    \item \textbf{BPA}作为精确时域算法，成像质量最佳，距离和方位分辨率偏差均小于0.5\%，但计算量最大
+    \item \textbf{RDA}和\textbf{CSA}作为频域算法，实现了计算效率与成像质量的良好平衡，偏差均在5\%以内
+    \item \textbf{wKA（修复版）}在保持较高成像质量的同时（偏差小于2\%），计算效率也较为理想
+    \item 所有算法的实测分辨率与理论值偏差均在5\%以内，验证了仿真系统的可靠性
+\end{itemize}
+
+
+具体的一些图像如下
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.75\linewidth]{psf_rda.png}
+\caption{RDA图像}
+\label{fig:psf_rda}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.75\linewidth]{psf_csa.png}
+\caption{CSA图像}
+\label{fig:psf_csa}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.75\linewidth]{psf_wka.png}
+\caption{wkA图像}
+\label{fig:psf_wka}
+\end{figure}
+
+\noindent \textbf{说明：}
+\begin{itemize}
+    \item 理论分辨率：距离=1.874 m，方位=0.1415 m
+    \item 修复版的wKA算法解决了原始实现中目标漂移和主瓣拓宽的问题。
+    \item PSLR（峰值旁瓣比）接近理想理论值-13.26dB。
+\end{itemize}
+
+\section{小结}
+本章实现了SAR成像算法，验证了GPU加速的有效性。理想条件下，BPA提供最佳质量，但需注意噪声缺失的影响。下一章将引入Hermite函数扩展抗噪能力。

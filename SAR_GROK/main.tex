@@ -1,0 +1,40 @@
+\documentclass[oneside,openany]{book}
+% Language setting
+% Replace `english' with e.g. `spanish' to change the document language
+\usepackage[english]{babel}
+% Set page size and margins
+% Replace `letterpaper' with `a4paper' for UK/EU standard size
+\usepackage[letterpaper,top=2cm,bottom=2cm,left=3cm,right=3cm,marginparwidth=1.75cm]{geometry}
+% Useful packages
+\usepackage{graphicx}
+\usepackage{ctex}
+\usepackage{listings}
+\usepackage{listingsutf8}
+% Additional Packages
+\usepackage{amsmath, amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage{float}
+% Custom Commands (modified: added more for GPU and complexity)
+\newcommand{\cpuonly}[1]{\textcolor{red}{[CPU] #1}}
+\newcommand{\gpuacc}[1]{\textcolor{green}{[GPU] #1}}
+\newcommand{\complexity}[2]{\hfill \textcolor{gray}{\small (CPU: $O(#1)$, GPU: $O(#2)$)}}
+\usepackage[colorlinks=true, allcolors=blue]{hyperref}
+
+\lstset{language=Python, basicstyle=\small\ttfamily, breaklines=true, frame=single}
+\title{Pulse Doppler Processing Lab Report}
+\author{邓嘉轩 \\ 合成孔径雷达成像原理探究}
+
+\begin{document}
+\maketitle
+
+\input{abstract}
+\input{chapter1}
+\input{chapter2}
+\input{chapter3}
+
+\end{document}
